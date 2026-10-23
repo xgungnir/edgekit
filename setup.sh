@@ -2,7 +2,7 @@
 # edgekit: one installed entry point for provisioning, management and renewal.
 set -Eeuo pipefail
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-EDGEKIT_VERSION=0.3.2
+EDGEKIT_VERSION=0.3.3
 ROOT=/etc/edgekit
 ENTRY=/usr/bin/ek
 DEFAULT_ENV=/root/.ek.env
@@ -35,7 +35,11 @@ LOG=/dev/null
 
 # ---------- Common checks and restricted operation logs ----------
 say() { printf '%s\n' "$*"; }
-fail() { say "Failed [$STAGE]: $*" >&3; exit 1; }
+report_error() {
+    say "$*" >&3
+    if [[ $LOG != /dev/null ]]; then say "$*" >>"$LOG" || true; fi
+}
+fail() { report_error "Failed [$STAGE]: $*"; exit 1; }
 root_required() { [[ $EUID == 0 ]] || fail 'Run this command with sudo or as root.'; }
 installed() { [[ -f $STATE/owner && -f $STATE/installed ]]; }
 require_install() { installed || fail 'No complete installation found. Check the installation log; configuration will not be initialized automatically.'; }
@@ -43,7 +47,7 @@ stage() { STAGE=$1; say "[$STAGE] $2"; }
 error_report() {
     local rc=$?
     trap - ERR
-    say "Failed [$STAGE]: operation incomplete (exit code ${rc}). Log: $LOG" >&3
+    report_error "Failed [$STAGE]: operation incomplete (exit code ${rc}). Log: $LOG"
     local s
     for s in xray nginx sing-box; do say "$s: $(systemctl is-active "$s" 2>/dev/null || true)" >&3; done
     exit "$rc"
@@ -237,11 +241,14 @@ base_tools() {
 }
 check_dns() {
     local ip records v6
-    ip=$(fetch -4 https://api.ipify.org)
+    ip=$(fetch -4 https://api.ipify.org 2>>"$LOG") || fail 'Cannot detect public IPv4: public address request failed. Check outbound HTTPS connectivity.'
     [[ $ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail 'Cannot detect public IPv4.'
-    records=$(getent ahostsv4 "$DOMAIN" | awk '{print $1}' | sort -u)
+    records=$(getent ahostsv4 "$DOMAIN" 2>>"$LOG" | awk '{print $1}' | sort -u) ||
+        fail "Cannot resolve an IPv4 address for ${DOMAIN}. Check the DOMAIN value, DNS A record and server DNS resolver, then retry installation."
+    [[ -n $records ]] || fail "No IPv4 address found for ${DOMAIN}. Create a DNS-only A record pointing to ${ip}, then retry installation."
     [[ $records == "$ip" ]] || fail "DOMAIN A record does not match this server's public IPv4 or is proxied. Check DNS."
-    v6=$(fetch "https://cloudflare-dns.com/dns-query?name=$DOMAIN&type=AAAA" -H 'accept: application/dns-json' | jq -r '.Answer[]? | select(.type==28) | .data')
+    v6=$(fetch "https://cloudflare-dns.com/dns-query?name=$DOMAIN&type=AAAA" -H 'accept: application/dns-json' 2>>"$LOG" | jq -r '.Answer[]? | select(.type==28) | .data' 2>>"$LOG") ||
+        fail 'Cannot query or parse AAAA records. Check outbound HTTPS connectivity and the DNS response.'
     if [[ -n $v6 ]]; then
         local public6
         public6=$(fetch -6 https://api64.ipify.org) || fail 'AAAA record exists, but IPv6 is unavailable on this server.'
@@ -812,14 +819,18 @@ firewall_remove() {
 # Keep reusable ACME state private after a failed install; stop incomplete services.
 # Retrying the same env resumes the owned installation; uninstall can also clean it.
 install_failed() {
-    local rc=$?
+    local rc=$? s load_state
     if ((rc != 0)) && ! installed; then
-        systemctl stop nginx xray sing-box >>"$LOG" 2>&1 || true
+        for s in nginx xray sing-box; do
+            load_state=$(systemctl show "$s" -p LoadState --value 2>/dev/null) || load_state=''
+            [[ -n $load_state && $load_state != not-found ]] || continue
+            systemctl stop "$s" >>"$LOG" 2>&1 || true
+        done
         rm -f /etc/cron.d/edgekit-acme
         if [[ -f $STATE/ufw-added ]]; then
             firewall_remove || say "Application firewall recovery failed. Check ${LOG}." >&3
         fi
-        say "Installation incomplete: stopped application services and removed added firewall rules. Private logs/ACME state remain in ${ROOT}; fix the issue and retry or run uninstall." >&3
+        say "Installation incomplete: cleanup attempted for existing application services and added firewall rules. Private logs/ACME state remain in ${ROOT}; fix the issue and retry or run uninstall." >&3
     fi
     return "$rc"
 }
