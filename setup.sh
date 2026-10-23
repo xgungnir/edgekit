@@ -2,7 +2,7 @@
 # edgekit: one installed entry point for provisioning, management and renewal.
 set -Eeuo pipefail
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-EDGEKIT_VERSION=0.1.0
+EDGEKIT_VERSION=0.2.0
 ROOT=/etc/edgekit
 ENTRY=/usr/bin/ek
 DEFAULT_ENV=/root/.ek.env
@@ -612,12 +612,32 @@ EOF
 EOF
     chown root:xray "$XR"/*.json; chmod 640 "$XR"/*.json
 }
+static_site() (
+    local work member
+    work=$(mktemp -d "$STATE/site.XXXXXX") || fail 'Cannot create the static site download directory.'
+    trap 'rm -rf -- "$work"' EXIT
+    fetch https://raw.githubusercontent.com/xgungnir/edgekit/master/misc/html.zip -o "$work/html.zip" || fail 'Static site download failed.'
+    unzip -Z1 "$work/html.zip" > "$work/members" || fail 'Invalid static site ZIP archive.'
+    install -d -m 755 "$work/site"
+    while IFS= read -r member || [[ -n $member ]]; do
+        # Stream each member into a regular file; never follow ZIP symlinks.
+        [[ -n $member && $member != /* && $member != *[!a-zA-Z0-9_./-]* ]] || fail 'Invalid static site archive path.'
+        case "/${member%/}/" in */../*|*/./*|*//*) fail 'Unsafe static site archive path.';; esac
+        if [[ $member == */ ]]; then
+            install -d -m 755 "$work/site/${member%/}"
+        else
+            install -d -m 755 "$(dirname -- "$work/site/$member")"
+            unzip -p "$work/html.zip" "$member" > "$work/site/$member" || fail 'Static site ZIP extraction failed.'
+            chmod 644 "$work/site/$member"
+        fi
+    done < "$work/members"
+    [[ -s $work/site/index.html ]] || fail 'Static site archive must contain a nonempty index.html at its root.'
+    install -d -m 755 "$ROOT/www"
+    cp -Rp "$work/site/." "$ROOT/www/"
+)
 nginx_config() {
-    install -d -m 755 "$ROOT/www" /etc/nginx/edgekit.d
-    cat > "$ROOT/www/index.html" <<'EOF'
-<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>edgekit</title><body><h1>edgekit</h1><p>HTTPS service is ready.</p></body></html>
-EOF
-    chmod 644 "$ROOT/www/index.html"
+    static_site
+    install -d -m 755 /etc/nginx/edgekit.d
     [[ ! -f /etc/nginx/conf.d/default.conf ]] || mv /etc/nginx/conf.d/default.conf "$STATE/nginx-default.conf"
     cat > /etc/nginx/conf.d/edgekit.conf <<EOF
 log_format edgekit '\$remote_addr \$server_name \$request \$status \$ssl_protocol \$ssl_curve';
