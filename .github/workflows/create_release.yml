@@ -1,0 +1,116 @@
+name: Release
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: edgekit-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout release commit
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Publish version and retain five releases
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const fs = require('node:fs');
+            const repo = context.repo;
+            const versionPattern = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/;
+            const source = fs.readFileSync('setup.sh', 'utf8');
+            const declarations = source.match(/^[ \t]*(?:export[ \t]+)?EDGEKIT_VERSION[ \t]*=.*$/gm) || [];
+            if (declarations.length !== 1) {
+              throw new Error('Expected exactly one EDGEKIT_VERSION assignment in setup.sh.');
+            }
+            const assignment = declarations[0].trim().match(/^EDGEKIT_VERSION=(.+)$/);
+            const version = assignment?.[1];
+            if (!version || !versionPattern.test(version)) {
+              throw new Error('EDGEKIT_VERSION must be an unquoted X.Y.Z version without leading zeros.');
+            }
+            const tag = `v${version}`;
+            const compareVersions = (left, right) => {
+              const a = left.slice(1).split('.').map(BigInt);
+              const b = right.slice(1).split('.').map(BigInt);
+              for (let i = 0; i < 3; i++) {
+                if (a[i] !== b[i]) return a[i] > b[i] ? -1 : 1;
+              }
+              return 0;
+            };
+            const optional = async (request) => {
+              try {
+                return (await request()).data;
+              } catch (error) {
+                if (error.status === 404) return null;
+                throw error;
+              }
+            };
+
+            // Include drafts and all pages when checking for an existing version.
+            const releases = await github.paginate(github.rest.repos.listReleases, {
+              ...repo, per_page: 100,
+            });
+            const existing = releases.find(release => release.tag_name === tag);
+            if (existing?.draft || existing?.prerelease) {
+              throw new Error(`${tag} already exists as a draft or prerelease.`);
+            }
+            if (existing) {
+              core.info(`${tag} is already published; checking retention only.`);
+            } else {
+              const ref = await optional(() => github.rest.git.getRef({
+                ...repo, ref: `tags/${tag}`,
+              }));
+              if (ref) {
+                let object = ref.object;
+                while (object.type === 'tag') {
+                  const annotated = await github.rest.git.getTag({
+                    ...repo, tag_sha: object.sha,
+                  });
+                  object = annotated.data.object;
+                }
+                if (object.type !== 'commit' || object.sha !== context.sha) {
+                  throw new Error(`${tag} does not point to this workflow commit ${context.sha}.`);
+                }
+              }
+              const { data: created } = await github.rest.repos.createRelease({
+                ...repo,
+                tag_name: tag,
+                name: tag,
+                target_commitish: context.sha,
+                generate_release_notes: true,
+                draft: false,
+                prerelease: false,
+                make_latest: 'legacy',
+              });
+              releases.push(created);
+              core.info(`Published ${created.html_url}`);
+            }
+
+            const stable = releases.filter(release =>
+              !release.draft && !release.prerelease &&
+              release.tag_name.startsWith('v') &&
+              versionPattern.test(release.tag_name.slice(1))
+            ).sort((a, b) => compareVersions(a.tag_name, b.tag_name));
+            for (const release of stable.slice(5)) {
+              core.info(`Deleting old release and tag ${release.tag_name}`);
+              await github.rest.repos.deleteRelease({
+                ...repo, release_id: release.id,
+              });
+              // A tag may already be absent; other failures must fail the run.
+              await optional(() => github.rest.git.deleteRef({
+                ...repo, ref: `tags/${release.tag_name}`,
+              }));
+            }
+            core.info(`Retained ${Math.min(stable.length, 5)} stable releases.`);

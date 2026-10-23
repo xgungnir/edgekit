@@ -1,0 +1,26 @@
+# Local agent instructions, development data and read-only reference repositories.
+/AGENTS.md
+/tmp/
+/reference/
+
+# Private installation inputs and machine inventory.
+/.env*
+/.ek.env
+/test.machines.txt
+
+# Local tools, test artifacts and caches, including legacy root locations.
+/.local/
+/artifacts/
+/test-results/
+/.cache/
+/.venv/
+__pycache__/
+*.pyc
+
+# Editor and operating system files.
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
