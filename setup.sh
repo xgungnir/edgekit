@@ -2,7 +2,7 @@
 # edgekit: one installed entry point for provisioning, management and renewal.
 set -Eeuo pipefail
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-EDGEKIT_VERSION=0.3.0
+EDGEKIT_VERSION=0.3.1
 ROOT=/etc/edgekit
 ENTRY=/usr/bin/ek
 DEFAULT_ENV=/root/.ek.env
@@ -1525,6 +1525,41 @@ ssh_guard_unban() {
     bans=$(fail2ban-client get "$SSH_JAIL" banip) || return 1
     for ip in $bans; do fail2ban-client set "$SSH_JAIL" unbanip "$ip" >/dev/null || return 1; done
 }
+# Repair a stock file-backed sshd jail only when SSH journal records are available.
+# Keep this backend setting when removing our separate password jail.
+ssh_guard_journal_backend() (
+    local file="$F2B_DIR/jail.d/edgekit-debian-sshd.local" f tmp='' config_error
+    if config_error=$(fail2ban-client -t 2>&1); then return 0; fi
+    [[ ${config_error//\'/} == *'Have not found any log file for sshd jail'* ]] ||
+        fail 'Fail2ban configuration has an unrelated error; no log backend changed.'
+    [[ -n $(journalctl --quiet --no-pager -n 1 -o json _SYSTEMD_UNIT=ssh.service + _COMM=sshd + _COMM=sshd-session 2>/dev/null) ]] ||
+        fail 'No readable SSH journal records found; no log backend changed.'
+    cmp -s <(printf '[sshd]\nenabled = true\n') "$F2B_DIR/jail.d/defaults-debian.conf" ||
+        fail 'Default sshd jail differs from the packaged configuration; configure its log backend manually.'
+    for f in "$F2B_DIR/paths-overrides.local" "$F2B_DIR/paths-debian.local"; do
+        [[ ! -f $f ]] || ! grep -Eq '^[[:space:]]*sshd_(log|backend)[[:space:]]*=' "$f" ||
+            fail 'Custom sshd log source found; configure its log backend manually.'
+    done
+    for f in "$F2B_DIR/jail.local" "$F2B_DIR"/jail.d/*.conf "$F2B_DIR"/jail.d/*.local; do
+        [[ -f $f && $f != "$file" && $f != "$F2B_DIR/jail.d/defaults-debian.conf" ]] || continue
+        ! grep -Eq '^[[:space:]]*\[sshd\][[:space:]]*([#;].*)?$' "$f" ||
+            fail 'Custom sshd jail settings found; configure its journal backend before enabling SSH protection.'
+    done
+    local content='# Managed by edgekit: Debian sshd journal backend
+[sshd]
+backend = systemd'
+    if [[ -e $file || -L $file ]]; then
+        [[ -f $file && ! -L $file ]] && cmp -s <(printf '%s\n' "$content") "$file" ||
+            fail "Unknown compatibility configuration; refusing to overwrite: ${file}"
+        return 0
+    fi
+    trap '[[ -z $tmp ]] || rm -f "$tmp"' EXIT
+    tmp=$(mktemp "$F2B_DIR/jail.d/.edgekit-sshd.XXXXXX")
+    printf '%s\n' "$content" > "$tmp"
+    chown 0:0 "$tmp"; chmod 644 "$tmp"
+    mv -T "$tmp" "$file"
+    say '[OK] Default sshd jail uses the available SSH journal; existing ban policy is unchanged.'
+)
 ssh_guard_cleanup() {
     local rc=$?
     if ((published && !complete)); then
@@ -1544,7 +1579,7 @@ ssh_guard_cleanup() {
 ssh_guard() (
     root_required; check_os
     STAGE='SSH protection'
-    local op=${1:-} yes=${2:-} work='' published=0 complete=0 existing=0
+    local op=${1:-} yes=${2:-} work='' published=0 complete=0 existing=0 config_error
     local missing=()
     [[ $# -le 2 && ( -z $yes || $yes == --yes ) ]] || fail 'Usage: ek ssh-guard [install|remove] [--yes]'
     if [[ -z $op ]]; then if ssh_guard_present; then op=remove; else op=install; fi; fi
@@ -1577,7 +1612,15 @@ ssh_guard() (
     fi
     if command -v fail2ban-client >/dev/null; then
         existing=1
-        fail2ban-client ping >/dev/null || fail 'Existing Fail2ban is not running; restore it first to avoid starting other jails unexpectedly.'
+        if ! fail2ban-client ping >/dev/null; then
+            # Recover a confirmed log-source failure, never an intentionally stopped service.
+            if systemctl is-failed --quiet fail2ban &&
+                ! config_error=$(fail2ban-client -t 2>&1) && [[ ${config_error//\'/} == *'Have not found any log file for sshd jail'* ]]; then
+                ssh_guard_journal_backend
+                fail2ban-client -t || fail 'Fail2ban still has invalid configuration; no service started.'
+                existing=0
+            else fail 'Existing Fail2ban is not running; restore it first to avoid starting other jails unexpectedly.'; fi
+        fi
     fi
     command -v fail2ban-client >/dev/null || missing+=(fail2ban)
     command -v nft >/dev/null || missing+=(nftables)
@@ -1588,6 +1631,7 @@ ssh_guard() (
         DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing[@]}"
     fi
     nft list tables >/dev/null || fail 'Usable nftables or network administration permissions are missing.'
+    if ((existing==0)); then ssh_guard_journal_backend; fi
     # Transient files share the destination filesystem; failure removes only our new files.
     work=$(mktemp -d "$F2B_DIR/.edgekit-ssh.XXXXXX")
     trap ssh_guard_cleanup EXIT
