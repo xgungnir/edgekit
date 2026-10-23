@@ -2,7 +2,7 @@
 # edgekit: one installed entry point for provisioning, management and renewal.
 set -Eeuo pipefail
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-EDGEKIT_VERSION=0.3.3
+EDGEKIT_VERSION=0.3.4
 ROOT=/etc/edgekit
 ENTRY=/usr/bin/ek
 DEFAULT_ENV=/root/.ek.env
@@ -213,7 +213,7 @@ preflight() {
     for p in nginx sing-box; do
         ! dpkg-query -W -f='${db:Status-Status}' "$p" 2>/dev/null | grep -qx installed || fail "Package $p is not managed by edgekit; refusing to take over."
     done
-    for p in "$XR_BIN" /usr/local/bin/xray /usr/local/etc/xray /usr/local/share/xray /var/log/xray "$SB_BIN" /etc/sing-box "$SB_STATE" /etc/systemd/system/sing-box.service /lib/systemd/system/sing-box.service /etc/nginx /etc/cron.d/edgekit-acme /usr/local/bin/ek /etc/systemd/system/xray.service; do
+    for p in "$XR_BIN" /usr/local/bin/xray /usr/local/etc/xray /usr/local/share/xray /var/log/xray "$SB_BIN" /etc/sing-box "$SB_STATE" /etc/systemd/system/sing-box.service /lib/systemd/system/sing-box.service /etc/nginx /usr/local/bin/ek /etc/systemd/system/xray.service; do
         [[ ! -e $p && ! -L $p ]] || fail "Resource ${p} already exists; refusing to overwrite."
     done
     if [[ ( -e $ENTRY || -L $ENTRY ) && $SELF != "$ENTRY" ]]; then
@@ -766,6 +766,40 @@ validate_certificate() {
     openssl x509 -in "$ROOT/certs/$domain/fullchain.pem" -noout -checkend 0 -checkhost "$domain" >/dev/null
     [[ $(openssl x509 -in "$ROOT/certs/$domain/fullchain.pem" -pubkey -noout | openssl pkey -pubin -outform DER | sha256sum) == "$(openssl pkey -in "$ROOT/certs/$domain/privkey.pem" -pubout -outform DER | sha256sum)" ]]
 }
+# Root crontab only; leave unrelated jobs and environment settings intact.
+renewal_cron() (
+    local op=$1 work marker job rc
+    marker='# edgekit: daily certificate renewal check (server local time)'
+    job="30 1 * * * $ENTRY renew >> $STATE/acme-renew.log 2>&1"
+    work=$(mktemp -d)
+    chmod 700 "$work"
+    trap 'rm -rf "$work"' EXIT
+    if LC_ALL=C crontab -u root -l > "$work/current" 2> "$work/error"; then :
+    else
+        rc=$?
+        if [[ $rc == 1 ]] && grep -Fxq 'no crontab for root' "$work/error"; then
+            : > "$work/current"
+        else
+            if [[ $op == present ]]; then return 2; fi
+            fail 'Cannot read root crontab; existing tasks were not changed.'
+        fi
+    fi
+    if [[ $op == present ]]; then grep -Fxq "$job" "$work/current"; return; fi
+    [[ $op == install || $op == remove ]] || fail 'Invalid renewal task operation.'
+    awk -v marker="$marker" -v job="$job" '$0 != marker && $0 != job' "$work/current" > "$work/next"
+    if [[ $op == install ]]; then printf '%s\n%s\n' "$marker" "$job" >> "$work/next"; fi
+    cmp -s "$work/current" "$work/next" && return 0
+    if [[ -s $work/next ]]; then
+        crontab -u root "$work/next" || fail 'Cannot update root crontab; installation or removal stopped.'
+    else crontab -u root -r || fail 'Cannot remove the empty root crontab; removal stopped.'; fi
+    LC_ALL=C crontab -u root -l > "$work/actual" 2> "$work/error" || {
+        rc=$?
+        [[ ! -s $work/next && $rc == 1 ]] && grep -Fxq 'no crontab for root' "$work/error" ||
+            fail 'Cannot verify root crontab after updating the renewal task.'
+        : > "$work/actual"
+    }
+    cmp -s "$work/next" "$work/actual" || fail 'Root crontab verification failed; check it before retrying.'
+)
 renew() {
     root_required; require_install; start_log renew
     exec 9>"$STATE/renew.lock"; flock -n 9 || fail 'Another renewal check is running.'
@@ -826,7 +860,9 @@ install_failed() {
             [[ -n $load_state && $load_state != not-found ]] || continue
             systemctl stop "$s" >>"$LOG" 2>&1 || true
         done
-        rm -f /etc/cron.d/edgekit-acme
+        if ((${renewal_added:-0})); then
+            renewal_cron remove || report_error 'Failed to remove the new renewal task; check root crontab before retrying.'
+        fi
         if [[ -f $STATE/ufw-added ]]; then
             firewall_remove || say "Application firewall recovery failed. Check ${LOG}." >&3
         fi
@@ -837,13 +873,19 @@ install_failed() {
 install_all() {
     root_required
     STAGE=Input
-    local envfile='' ca=letsencrypt fresh=0
+    local envfile='' ca=letsencrypt fresh=0 renewal_added=0
     local args=("$@")
     [[ -f $STATE/owner ]] || fresh=1
     while (($#)); do
         case $1 in --env) [[ $# -ge 2 ]] || fail '--env requires a path.'; envfile=$2; shift 2;; --staging) ca=letsencrypt_test; shift;; *) fail 'Usage: install [--env <FILE>] [--staging]';; esac
     done
-    if installed; then say 'Already installed: reuse existing configuration and credentials; no automatic upgrade.'; status; return; fi
+    if installed; then
+        start_log install
+        exec 8>"$STATE/operation.lock"; flock -n 8 || fail 'Another management operation is running.'
+        renewal_cron install
+        say 'Already installed: reuse existing configuration and credentials; renewal task verified; no automatic upgrade.'
+        status; return
+    fi
     prepare_entry install "${args[@]}"
     envfile=${envfile:-$DEFAULT_ENV}
     if [[ $envfile == "$DEFAULT_ENV" && ! -e $envfile && ! -L $envfile ]]; then
@@ -860,10 +902,6 @@ install_all() {
     if [[ ! -f $STATE/owner ]]; then
         touch "$STATE/owner"
         printf '%s\n' "$DOMAIN" > "$STATE/domain"
-        if dpkg-query -W -f='${db:Status-Status}' cron 2>/dev/null | grep -qx installed; then
-            systemctl is-enabled cron > "$STATE/cron-enabled-before" 2>/dev/null || true
-            systemctl is-active cron > "$STATE/cron-active-before" 2>/dev/null || true
-        fi
         dpkg-query -W -f='${binary:Package} ${Version}\n' > "$STATE/packages-before" 2>/dev/null
         for s in nginx xray sing-box cron; do systemctl is-enabled "$s" >>"$STATE/services-before" 2>/dev/null || true; done
         for s in nginx xray sing-box; do id "$s" >/dev/null 2>&1 || printf '%s\n' "$s" >> "$STATE/users-new"; done
@@ -904,12 +942,8 @@ install_all() {
     systemctl enable nginx xray sing-box >>"$LOG" 2>&1
     systemctl restart nginx xray sing-box >>"$LOG" 2>&1
     verify_services
-    cat > /etc/cron.d/edgekit-acme <<EOF
-SHELL=/bin/bash
-PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-30 1 * * * root $ENTRY renew >> $STATE/acme-renew.log 2>&1
-EOF
-    chmod 644 /etc/cron.d/edgekit-acme
+    renewal_added=1
+    renewal_cron install
     rm -rf "$STATE/cert-good"
     cp -a "$ROOT/certs/$DOMAIN" "$STATE/cert-good"
     touch "$STATE/installed"
@@ -1689,7 +1723,7 @@ uninstall() {
     exec 8>"$STATE/operation.lock"; flock -n 8 || fail 'Another management operation is running.'
     stage 'Uninstall edgekit' 'Stop application services and remove deployed resources.'
     local s
-    rm -f /etc/cron.d/edgekit-acme
+    renewal_cron remove
     for s in nginx xray sing-box; do systemctl disable --now "$s" >>"$LOG" 2>&1 || true; done
     if [[ -f $STATE/ufw-added ]]; then
         firewall_remove
@@ -1702,10 +1736,6 @@ uninstall() {
         while read -r s; do if id "$s" >/dev/null 2>&1; then userdel "$s" >>"$LOG" 2>&1; fi; done < "$STATE/users-new"
     fi
     systemctl daemon-reload
-    if [[ -f $STATE/cron-enabled-before ]]; then
-        if [[ $(cat "$STATE/cron-enabled-before") == disabled ]]; then systemctl disable cron >>"$LOG" 2>&1; fi
-        if [[ $(cat "$STATE/cron-active-before") == inactive ]]; then systemctl stop cron >>"$LOG" 2>&1; fi
-    fi
     ! ss -H -lnt 'sport = :443 or sport = :9443' | grep -q . || fail 'Application TCP ports are still in use.'
     ! ss -H -lnu 'sport = :8443' | grep -q . || fail 'Application UDP port is still in use.'
     # Retained TLS has no service or cron entry. Never remove its parent blindly.
@@ -1760,7 +1790,13 @@ status() {
             certificate="$domain ${days} days remaining"
         else certificate="$domain missing or unreadable"; fi
     fi
-    if [[ -f /etc/cron.d/edgekit-acme ]]; then renewal="01:30 $(systemctl is-active cron 2>/dev/null || true)"; fi
+    if command -v crontab >/dev/null; then
+        if renewal_cron present; then renewal="root crontab 01:30 $(systemctl is-active cron 2>/dev/null || true)"
+        else
+            local cron_rc=$?
+            if ((cron_rc != 1)); then renewal='root crontab unreadable'; fi
+        fi
+    fi
     say "Certificate ${certificate}; renewal ${renewal}"
 }
 menu() {
