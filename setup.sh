@@ -2,7 +2,7 @@
 # edgekit: one installed entry point for provisioning, management and renewal.
 set -Eeuo pipefail
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-EDGEKIT_VERSION=0.3.1
+EDGEKIT_VERSION=0.3.2
 ROOT=/etc/edgekit
 ENTRY=/usr/bin/ek
 DEFAULT_ENV=/root/.ek.env
@@ -1316,7 +1316,7 @@ network_conflicts() {
     if ((earlier)); then say "[INFO] ${NETWORK_CONF##*/} loads later and overrides these values; original files are kept."; fi
 }
 network_interface() {
-    local family rules routes selected='' dev='' link path chosen=4
+    local family rules routes selected='' dev='' link path target
     for family in 4 6; do
         rules=$(ip -j -"$family" rule show)
         jq -e 'all(.[];
@@ -1327,14 +1327,18 @@ network_interface() {
              (.priority==32767 and (.table=="default" or .table==253)))) and
             (group_by(.priority)|all(.[];length==1))' <<< "$rules" >/dev/null || fail "IPv${family} has policy routing; refusing to guess the public interface."
         routes=$(ip -j -"$family" route show table main default)
-        jq -e 'length<=1 and all(.[]; (.dev|type)=="string" and
-            (has("nexthops")|not) and (.type // "unicast")=="unicast" and
+        jq -e '([.[].dev]|unique|length)<=1 and all(.[]; (.dev|type)=="string" and
+            (has("nexthops") or has("nhid")|not) and (.type // "unicast")=="unicast" and
             ((.flags // [])|all(.[]; .!="linkdown" and .!="dead")))' <<< "$routes" >/dev/null || fail "IPv${family} default route is ambiguous, unavailable or multipath; refusing to change the interface."
         dev=$(jq -r '.[0].dev // empty' <<< "$routes")
         if [[ -n $dev ]]; then
             [[ -z $selected || $selected == "$dev" ]] || fail 'IPv4/IPv6 default routes use different interfaces. Check manually; no automatic selection.'
-            [[ -n $selected ]] || chosen=$family
             selected=$dev
+            target=1.1.1.1
+            [[ $family == 4 ]] || target=2606:4700:4700::1111
+            routes=$(ip -j -"$family" route get "$target")
+            jq -e --arg dev "$selected" 'length==1 and .[0].dev==$dev' <<< "$routes" >/dev/null ||
+                fail "Route lookup for IPv${family} does not match the default interface."
         fi
     done
     [[ $selected =~ ^[a-zA-Z0-9_.:-]{1,15}$ ]] || fail 'Cannot reliably identify the default outbound interface.'
@@ -1344,10 +1348,6 @@ network_interface() {
     link=$(ip -d -j link show dev "$selected")
     jq -e 'length==1 and .[0].link_type=="ether" and
         (.[0].linkinfo.info_kind // "")=="" and (.[0].flags|index("UP"))!=null' <<< "$link" >/dev/null || fail "${selected} is not an active Ethernet interface that can be safely managed."
-    local target=1.1.1.1
-    [[ $chosen == 4 ]] || target=2606:4700:4700::1111
-    routes=$(ip -j -"$chosen" route get "$target")
-    jq -e --arg dev "$selected" 'length==1 and .[0].dev==$dev' <<< "$routes" >/dev/null || fail 'Route lookup does not match the default interface.'
     printf '%s\n' "$selected"
 }
 network_qdisc() {
