@@ -2,7 +2,7 @@
 # edgekit: one installed entry point for provisioning, management and renewal.
 set -Eeuo pipefail
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-EDGEKIT_VERSION=0.2.0
+EDGEKIT_VERSION=0.3.0
 ROOT=/etc/edgekit
 ENTRY=/usr/bin/ek
 DEFAULT_ENV=/root/.ek.env
@@ -452,13 +452,14 @@ tls_configure() (
 
 # ---------- Xray versions, credentials and configuration ----------
 xray_target() {
-    local channel=$1
-    case $channel in stable|pre-release|latest) ;; *) fail 'Channel must be stable or pre-release.';; esac
+    local selection=$1
+    case $selection in latest|release) ;; *) fail 'Xray selection must be latest or release.';; esac
     fetch 'https://api.github.com/repos/XTLS/Xray-core/releases?per_page=100' |
-        jq -er --arg channel "$channel" '[.[] | select(.draft==false) |
-            select($channel=="latest" or .prerelease==($channel=="pre-release"))] |
-            sort_by(.published_at) | last | .tag_name | select(test("^v[0-9]+([.][0-9]+)+$"))' ||
-        fail "No Xray $channel release available. Check the network or GitHub API rate limit."
+        jq -ec --arg selection "$selection" '[.[] | select(.draft==false) |
+            select($selection=="latest" or .prerelease==false)] | sort_by(.published_at) | last |
+            select((.tag_name | type=="string" and test("^v[0-9]+([.][0-9]+)+$")) and (.prerelease | type=="boolean")) |
+            {tag_name,prerelease}' ||
+        fail "No Xray $selection version available. Check the network or GitHub API rate limit."
 }
 singbox_target() {
     fetch https://api.github.com/repos/SagerNet/sing-box/releases/latest |
@@ -467,6 +468,22 @@ singbox_target() {
 }
 xray_version() { "$XR_BIN" version 2>/dev/null | awk 'NR==1{print $2}'; }
 singbox_version() { "$SB_BIN" version 2>/dev/null | awk 'NR==1{print $3}'; }
+xray_release_type() {
+    jq -er --arg tag "v$1" 'select(.tag==$tag) |
+        if .prerelease==true then "pre-release" elif .prerelease==false then "release" else empty end' \
+        "$STATE/xray-release.json" 2>/dev/null
+}
+xray_refresh_type() (
+    local target=$1 prerelease=$2 tmp=''
+    [[ -f $STATE/xray-release.json ]] || return 0
+    jq -e --arg target "$target" '.tag==$target' "$STATE/xray-release.json" >/dev/null || fail 'Installed Xray release record does not match the running version.'
+    jq -e --argjson flag "$prerelease" '.prerelease==$flag' "$STATE/xray-release.json" >/dev/null && return 0
+    trap '[[ -z $tmp ]] || rm -f "$tmp"' EXIT
+    tmp=$(mktemp "$STATE/xray-release.XXXXXX")
+    jq --argjson flag "$prerelease" '.prerelease=$flag' "$STATE/xray-release.json" > "$tmp"
+    chmod 600 "$tmp"
+    mv -f "$tmp" "$STATE/xray-release.json"
+)
 # Both proxies use official GitHub assets; no vendor installer or proxy APT source.
 proxy_install() (
     root_required; check_os
@@ -486,7 +503,7 @@ proxy_install() (
     esac
     work=$(mktemp -d "$STATE/$component-download.XXXXXX")
     fetch "https://api.github.com/repos/$repo/releases/tags/$target" > "$work/release.json"
-    jq -e --arg target "$target" --arg component "$component" '.tag_name==$target and .draft==false and ($component=="xray" or .prerelease==false)' "$work/release.json" >/dev/null || fail 'Release metadata does not match the selected version/channel.'
+    jq -e --arg target "$target" --arg component "$component" '.tag_name==$target and .draft==false and (.prerelease | type=="boolean") and ($component=="xray" or .prerelease==false)' "$work/release.json" >/dev/null || fail 'Release metadata does not match the selected version or type.'
     # Require one exact official asset and its GitHub SHA256; never accept unchecked files.
     jq -e --arg name "$asset" --arg repo "$repo" --arg target "$target" '
         [.assets[] | select(.name==$name and .state=="uploaded") |
@@ -503,8 +520,8 @@ proxy_install() (
     if [[ $component == xray ]]; then actual=$("$work/binary" version | awk 'NR==1{print $2}')
     else actual=$("$work/binary" version | awk 'NR==1{print $3}'); fi
     [[ $actual == "${target#v}" ]] || fail "${component} candidate binary version mismatch."
-    jq --arg component "$component" --arg repo "$repo" --arg tag "$target" \
-        '{component:$component,repository:$repo,tag:$tag,name,url:.browser_download_url,sha256:(.digest|sub("^sha256:";"")),integrity:"GitHub HTTPS asset SHA256; no publisher signature verification"}' "$work/asset.json" > "$work/record.json"
+    jq --arg component "$component" --arg repo "$repo" --arg tag "$target" --slurpfile release "$work/release.json" \
+        '{component:$component,repository:$repo,tag:$tag,prerelease:$release[0].prerelease,name,url:.browser_download_url,sha256:(.digest|sub("^sha256:";"")),integrity:"GitHub HTTPS asset SHA256; no publisher signature verification"}' "$work/asset.json" > "$work/record.json"
     # Same-directory rename replaces even a running binary without truncating it.
     atomic=$(mktemp "${bin}.XXXXXX")
     install -m 755 -o root -g root "$work/binary" "$atomic"
@@ -856,7 +873,7 @@ install_all() {
     proxy_services
     local target
     if [[ ! -x $XR_BIN || ! -f $STATE/xray-release.json ]]; then
-        target=$(xray_target latest)
+        target=$(xray_target latest | jq -er .tag_name)
         proxy_install xray "$target"
     else [[ v$(xray_version) == "$(jq -r .tag "$STATE/xray-release.json")" ]] || fail 'Existing Xray binary does not match its installation record.'; fi
     if [[ ! -x $SB_BIN || ! -f $STATE/sing-box-release.json ]]; then
@@ -897,18 +914,34 @@ proxy_check() {
     else "$SB_BIN" check -c "$SB_CONFIG"; fi
 }
 update_proxy() {
-    local component=$1 channel=$2 yes=${3:-} bin current target backup
+    local component=$1 selection=$2 yes=${3:-} bin current target backup metadata prerelease current_type target_type
     root_required; require_install; check_os; start_log "update-$component"
     exec 8>"$STATE/operation.lock"; flock -n 8 || fail 'Another management operation is running.'
     systemctl is-active --quiet "$component" || fail "${component} service is unhealthy. Diagnose it first."
-    stage Versions "Query ${component} GitHub releases; channel: ${channel}."
     if [[ $component == xray ]]; then
-        bin=$XR_BIN; current=$(xray_version); target=$(xray_target "$channel")
-    else bin=$SB_BIN; current=$(singbox_version); target=$(singbox_target); fi
+        if [[ $selection == latest ]]; then stage Versions 'Checking the latest published Xray version.'
+        else stage Versions 'Checking the latest release Xray version (excluding pre-release).'; fi
+        bin=$XR_BIN; current=$(xray_version); metadata=$(xray_target "$selection")
+        target=$(jq -er .tag_name <<< "$metadata")
+        prerelease=$(jq -r .prerelease <<< "$metadata")
+        current_type=$(xray_release_type "$current" || true)
+        target_type=release; [[ $prerelease != true ]] || target_type=pre-release
+        say "Current: ${current}${current_type:+ ($current_type)}"
+        say "Target:  ${target#v} (${target_type})"
+    else
+        stage Versions 'Query the latest stable sing-box release from GitHub.'
+        bin=$SB_BIN; current=$(singbox_version); target=$(singbox_target)
+        say "${component} current: ${current}; target: ${target}."
+    fi
     [[ -x $bin ]] || fail "${component} binary is missing; no automatic initialization."
-    say "${component} current: ${current}; target: ${target}; channel: ${channel}."
-    [[ $current != "${target#v}" ]] || { say 'Already up to date.'; return; }
-    if [[ $component == xray && $channel == stable ]]; then say 'Switching to the stable channel may downgrade the version.'; fi
+    if [[ $current == "${target#v}" ]]; then
+        [[ $component != xray ]] || xray_refresh_type "$target" "$prerelease"
+        say 'Already up to date.'; return
+    fi
+    if [[ $component == xray ]] && jq -en --arg current "$current" --arg target "${target#v}" \
+        '($target | split(".") | map(tonumber)) < ($current | split(".") | map(tonumber))' >/dev/null; then
+        say 'The target Xray version is older; this operation will downgrade Xray.'
+    fi
     [[ $yes == --yes ]] || { confirm || { say 'Cancelled.'; return; }; }
     backup=$(mktemp -d "$STATE/$component-update.XXXXXX")
     cp -p "$bin" "$backup/binary"
@@ -931,10 +964,113 @@ update_proxy() {
     fi
 }
 update_xray() {
-    case ${1:-} in stable|pre-release) ;; *) fail 'Channel must be stable or pre-release.';; esac
-    update_proxy xray "$1" "${2:-}"
+    local selection=latest yes=''
+    case ${1:-} in latest|release) selection=$1; shift;; esac
+    if [[ ${1:-} == --yes ]]; then yes=--yes; shift; fi
+    [[ $# == 0 ]] || fail 'Usage: update-xray [latest|release] [--yes].'
+    update_proxy xray "$selection" "$yes"
 }
 update_singbox() { update_proxy sing-box stable "${1:-}"; }
+
+# Read version metadata without executing the installed or downloaded script.
+edgekit_file_version() {
+    awk '
+        /^[[:space:]]*(export[[:space:]]+)?EDGEKIT_VERSION[[:space:]]*=/ {
+            count++
+            if ($0 !~ /^EDGEKIT_VERSION=(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/) invalid=1
+            sub(/^EDGEKIT_VERSION=/, ""); version=$0
+        }
+        END { if (count!=1 || invalid) exit 1; print version }
+    ' "$1"
+}
+edgekit_version_newer() {
+    local i a b LC_ALL=C
+    local target_parts current_parts
+    IFS=. read -r -a target_parts <<< "$1"
+    IFS=. read -r -a current_parts <<< "$2"
+    for i in 0 1 2; do
+        a=${target_parts[i]}; b=${current_parts[i]}
+        ((${#a} == ${#b})) || { ((${#a} > ${#b})); return; }
+        [[ $a == "$b" ]] || { [[ $a > $b ]]; return; }
+    done
+    return 1
+}
+edgekit_update_tools() {
+    local pair cmd pkg missing=() packages=()
+    for pair in curl:curl jq:jq flock:util-linux awk:mawk cmp:diffutils mktemp:coreutils install:coreutils mv:coreutils cp:coreutils rm:coreutils stat:coreutils timeout:coreutils; do
+        cmd=${pair%:*}; pkg=${pair#*:}
+        if ! command -v "$cmd" >/dev/null; then
+            missing+=("$cmd")
+            case " ${packages[*]} " in *" $pkg "*) ;; *) packages+=("$pkg");; esac
+        fi
+    done
+    ((${#missing[@]} == 0)) || fail "Missing update tools: ${missing[*]}. Install the required Debian packages and retry: apt-get install ${packages[*]}"
+}
+edgekit_script_check() {
+    local reported
+    /bin/bash -n "$1" >>"$LOG" 2>&1 || return 1
+    reported=$(timeout 10 /bin/bash "$1" --version 2>>"$LOG") || return 1
+    [[ $reported == "edgekit $2" ]] || return 1
+    timeout 10 /bin/bash "$1" --help >>"$LOG" 2>&1
+}
+update_edgekit() (
+    local yes=${1:-} current target version release work='' atomic='' replaced=0 keep=0
+    [[ $# -le 1 && ( -z $yes || $yes == --yes ) ]] || fail 'Usage: update-edgekit [--yes].'
+    root_required; require_install; check_os
+    edgekit_update_tools
+    [[ -f $ENTRY && -x $ENTRY && ! -L $ENTRY && $(stat -c '%u:%g:%a' "$ENTRY") == 0:0:755 ]] ||
+        fail "Installed entry ${ENTRY} must be a root-owned regular file with mode 0755."
+    start_log update-edgekit
+    exec 8>"$STATE/operation.lock"; flock -n 8 || fail 'Another management operation is running.'
+    exec 9>"$STATE/renew.lock"; flock -n 9 || fail 'A renewal check is running; retry the update later.'
+    current=$(edgekit_file_version "$ENTRY") || fail 'Cannot read the installed edgekit version.'
+    stage Versions 'Query the latest stable edgekit release from GitHub.'
+    release=$(fetch https://api.github.com/repos/xgungnir/edgekit/releases/latest) || fail 'Cannot query the latest edgekit release.'
+    target=$(jq -er 'select(.draft==false and .prerelease==false) | .tag_name |
+        select(type=="string" and test("^v(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)$"))' <<< "$release") ||
+        fail 'Invalid stable edgekit release metadata.'
+    version=${target#v}
+    say "edgekit current: ${current}; target: ${target}."
+    [[ $current != "$version" ]] || { say 'Already up to date.'; return 0; }
+    edgekit_version_newer "$version" "$current" || { say 'Installed edgekit is newer than the latest release; no downgrade performed.'; return 0; }
+    say 'Replace the ek script only; keep component binaries, configuration, certificates and website. No service restart.'
+    [[ $yes == --yes ]] || { confirm || { say 'Cancelled.'; return 0; }; }
+    # Keep one backup for this operation; restore atomically after any failed replacement.
+    edgekit_update_cleanup() {
+        local rc=$? restore=''
+        trap - EXIT
+        if ((replaced)); then
+            if restore=$(mktemp "${ENTRY}.XXXXXX") &&
+                install -m 755 -o root -g root "$work/previous.sh" "$restore" && mv -f "$restore" "$ENTRY"; then
+                restore=""
+                say "Previous edgekit entry restored." >&3
+            else
+                keep=1; rc=1
+                say "Recovery failed; previous entry kept at ${work}/previous.sh." >&3
+            fi
+        fi
+        [[ -z $restore ]] || rm -f "$restore"
+        [[ -z $atomic ]] || rm -f "$atomic"
+        if [[ -n $work ]] && ((keep==0)); then rm -rf "$work"; fi
+        exit "$rc"
+    }
+    trap edgekit_update_cleanup EXIT
+    trap 'exit 130' INT TERM
+    work=$(mktemp -d "$STATE/edgekit-update.XXXXXX")
+    stage Download "Download setup.sh from release ${target}; verify version and Bash entry points."
+    fetch "https://raw.githubusercontent.com/xgungnir/edgekit/$target/setup.sh" -o "$work/setup.sh" || fail 'Edgekit script download failed.'
+    [[ -s $work/setup.sh && $(edgekit_file_version "$work/setup.sh") == "$version" ]] || fail 'Downloaded edgekit version does not match the release.'
+    edgekit_script_check "$work/setup.sh" "$version" || fail 'Downloaded edgekit failed syntax or entry point checks.'
+    cp -p "$ENTRY" "$work/previous.sh"
+    atomic=$(mktemp "${ENTRY}.XXXXXX")
+    install -m 755 -o root -g root "$work/setup.sh" "$atomic"
+    replaced=1
+    mv -f "$atomic" "$ENTRY"; atomic=''
+    edgekit_script_check "$ENTRY" "$version" || fail 'Updated edgekit entry failed verification.'
+    replaced=0
+    cleanup_bootstrap
+    say "Success: edgekit updated to ${version}; configuration and running services kept."
+)
 # Verify running master/workers map the current library files, including after a restart.
 tls_loaded() {
     local dir=${1:-} master pid lib file inode workers
@@ -1545,12 +1681,17 @@ tls_status() {
     fi
 }
 status() {
-    local s v domain expiry endepoch days certificate=unconfigured renewal=unconfigured
+    local s v release_type domain expiry endepoch days certificate=unconfigured renewal=unconfigured
     say "edgekit $EDGEKIT_VERSION"
     for s in xray sing-box nginx; do
         v=absent
         case $s in
-            xray) [[ ! -x "$XR_BIN" ]] || v=$(display_version xray_version);;
+            xray)
+                if [[ -x $XR_BIN ]]; then
+                    v=$(display_version xray_version)
+                    release_type=$(xray_release_type "$v" || true)
+                    [[ -z $release_type ]] || v+=" ($release_type)"
+                fi;;
             sing-box) [[ ! -x $SB_BIN ]] || v=$(display_version singbox_version);;
             nginx) [[ ! -x /usr/sbin/nginx ]] || v=$(display_version nginx_cmd -v);;
         esac
@@ -1568,11 +1709,11 @@ status() {
     say "Certificate ${certificate}; renewal ${renewal}"
 }
 menu() {
-    local choice sub
+    local choice sub version
     [[ $EUID == 0 ]] || say 'Management requires root privileges. Run sudo ek.'
     while true; do
         status
-        say $'\n1. Update Xray\n2. Update sing-box\n3. Check certificate renewal\n4. Uninstall edgekit\n5. Update edgekit (not available yet)\n6. Update TLS / OpenSSL\n7. Network tuning'
+        say $'\n1. Update Xray\n2. Update sing-box\n3. Check certificate renewal\n4. Uninstall edgekit\n5. Update edgekit\n6. Update TLS / OpenSSL\n7. Network tuning'
         say "8. $(ssh_guard_label)"
         say '0. Exit'
         read -r -p 'Select an option: ' choice || return 0
@@ -1580,14 +1721,19 @@ menu() {
             0) return 0;;
             1)
                 while true; do
-                    say $'1. Latest stable release\n2. Latest pre-release\n0. Back'
-                    read -r -p 'Select a channel: ' sub || return 0
-                    case $sub in 0) break;; 1) /bin/bash "$ENTRY" update-xray stable || say "Operation failed (exit code $?)"; break;; 2) /bin/bash "$ENTRY" update-xray pre-release || say "Operation failed (exit code $?)"; break;; *) say 'Invalid input. Try again.';; esac
+                    say $'1. Latest published version\n2. Latest release version\n0. Back'
+                    read -r -p 'Select a version source: ' sub || return 0
+                    case $sub in 0) break;; 1) /bin/bash "$ENTRY" update-xray latest || say "Operation failed (exit code $?)"; break;; 2) /bin/bash "$ENTRY" update-xray release || say "Operation failed (exit code $?)"; break;; *) say 'Invalid input. Try again.';; esac
                 done;;
             2) /bin/bash "$ENTRY" update-sing-box || say "Operation failed (exit code $?)";;
             3) /bin/bash "$ENTRY" renew || say "Operation failed (exit code $?)";;
             4) /bin/bash "$ENTRY" uninstall || say "Operation failed (exit code $?)"; [[ -f $STATE/owner ]] || return 0;;
-            5) say 'No edgekit update URL is configured; no update performed.';;
+            5)
+                if /bin/bash "$ENTRY" update-edgekit; then
+                    if version=$(edgekit_file_version "$ENTRY") && [[ $version != "$EDGEKIT_VERSION" ]]; then
+                        exec /bin/bash "$ENTRY"
+                    fi
+                else say "Operation failed (exit code $?)"; fi;;
             6) /bin/bash "$ENTRY" update-tls || say "Operation failed (exit code $?)";;
             7) /bin/bash "$ENTRY" tune-network || say "Operation failed (exit code $?)";;
             8) /bin/bash "$ENTRY" ssh-guard || say "Operation failed (exit code $?)";;
@@ -1612,13 +1758,15 @@ main() {
         deploy-cert) deploy_cert;;
         update-xray) update_xray "$@";;
         update-sing-box) update_singbox "$@";;
+        update-edgekit) update_edgekit "$@";;
         update-tls) update_tls "$@";;
         tune-network) tune_network "$@";;
         ssh-guard) ssh_guard "$@";;
         uninstall) uninstall "$@";;
         _load-cert-services) root_required; start_log deploy-cert; validate_certificate "$(cat "$STATE/domain")"; check_configs; systemctl reload nginx; systemctl restart sing-box; verify_services;;
         _proxy-install) root_required; require_install; start_log "update-${1:-proxy}"; proxy_install "$@";;
-        --help|-h) say 'Usage: ek [install [--env <FILE>] [--staging]] | status | menu | renew | update-xray stable|pre-release [--yes] | update-sing-box [--yes] | update-tls [--yes] | tune-network [--yes|--check] | ssh-guard [install|remove] [--yes] | uninstall [--yes]';;
+        --version) say "edgekit $EDGEKIT_VERSION";;
+        --help|-h) say 'Usage: ek [install [--env <FILE>] [--staging]] | status | menu | renew | update-xray [latest|release] [--yes] | update-sing-box [--yes] | update-edgekit [--yes] | update-tls [--yes] | tune-network [--yes|--check] | ssh-guard [install|remove] [--yes] | uninstall [--yes] | --version';;
         *) fail 'Unknown command. Use --help for usage.';;
     esac
 }
