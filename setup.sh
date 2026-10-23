@@ -2,7 +2,7 @@
 # edgekit: one installed entry point for provisioning, management and renewal.
 set -Eeuo pipefail
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-EDGEKIT_VERSION=0.3.4
+EDGEKIT_VERSION=0.3.5
 ROOT=/etc/edgekit
 ENTRY=/usr/bin/ek
 DEFAULT_ENV=/root/.ek.env
@@ -147,7 +147,8 @@ start() {
 init_menu() {
     local choice
     while true; do
-        say $'edgekit installation is incomplete\n1. Install / Retry installation\n2. Clean up incomplete installation'
+        say "edgekit $EDGEKIT_VERSION"
+        say $'edgekit installation is incomplete\n1. Install / Retry installation\n2. Clean up incomplete installation\n7. Network tuning'
         say "8. $(ssh_guard_label)"
         say '0. Exit'
         read -r -p 'Select an option: ' choice || return 0
@@ -159,6 +160,7 @@ init_menu() {
                     if installed; then menu; return; fi
                 else say 'Cancelled.'; fi;;
             2) /bin/bash "$ENTRY" uninstall || say "Cleanup failed (exit code $?)"; [[ -f $ENTRY ]] || return 0;;
+            7) /bin/bash "$ENTRY" tune-network || say "Operation failed (exit code $?)";;
             8) /bin/bash "$ENTRY" ssh-guard || say "Operation failed (exit code $?)";;
             '') say 'No option selected.';;
             *) say 'Invalid input. Try again.';;
@@ -1437,9 +1439,9 @@ network_verify() {
     ((bad == 0))
 }
 tune_network() (
-    local option=${1:-} dev kind atomic='' changed=0
+    local option=${1:-} dev kind atomic='' changed=0 STATE=/var/lib/edgekit-network
     [[ $# -le 1 && ( -z $option || $option == --yes || $option == --check ) ]] || fail 'Usage: tune-network [--yes|--check].'
-    root_required; require_install; check_os
+    root_required; check_os
     if [[ $option != --check ]]; then
         say 'Apply network tuning and switch the default public interface root qdisc to fq_pie; no network or VPS restart.'
         network_conflicts <(network_config)
