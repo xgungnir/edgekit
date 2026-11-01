@@ -27,3 +27,15 @@ Other fields can stay blank to generate credentials automatically.
 ## Manage
 
 Run `ek` to open the management menu, or `ek --help` to list commands.
+
+To apply changed installation settings, edit `/root/.ek.env` and select
+`9. Reinstall`, or run `ek reinstall`. A missing input file stops the operation.
+The script compares the input with deployed settings and lists changed variable
+names and affected components before asking for confirmation. Matching input
+leaves the installation unchanged; blank optional fields keep current credentials.
+Only affected components are reconfigured, using their installed versions.
+Changing only `CF_ZONE_TOKEN` saves it for renewal. Token usability is checked
+when acme.sh uses it to issue or renew a certificate.
+Domain changes also update certificates, Nginx, REALITY and TUIC together.
+Failed changes restore the previous configuration and services; if recovery fails,
+the script reports the retained backup path. Use `ek reinstall --yes` to skip confirmation.

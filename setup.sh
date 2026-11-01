@@ -2,7 +2,7 @@
 # edgekit: one installed entry point for provisioning, management and renewal.
 set -Eeuo pipefail
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-EDGEKIT_VERSION=0.3.5
+EDGEKIT_VERSION=0.4.0
 ROOT=/etc/edgekit
 ENTRY=/usr/bin/ek
 DEFAULT_ENV=/root/.ek.env
@@ -29,6 +29,7 @@ SB_BIN=/usr/bin/sing-box
 SB_CONFIG=/etc/sing-box/config.json
 SB_STATE=/var/lib/sing-box
 SB_LOG=$ROOT/sing-box/error.log
+NGINX_CONFIG=/etc/nginx/conf.d/edgekit.conf
 SELF=$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")
 STAGE=Entry
 LOG=/dev/null
@@ -192,7 +193,7 @@ read_env() {
     done < "$file"
     [[ ${#DOMAIN} -le 253 && $DOMAIN =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,63}$ ]] || fail "${file}: invalid DOMAIN; enter a fully qualified domain name."
     DOMAIN=${DOMAIN,,}
-    [[ $CF_ZONE_TOKEN =~ ^[a-zA-Z0-9_-]{20,256}$ ]] || fail "${file}: missing or invalid CF_ZONE_TOKEN; enter a zone token."
+    [[ ${#CF_ZONE_TOKEN} -ge 20 && ${#CF_ZONE_TOKEN} -le 256 && $CF_ZONE_TOKEN =~ ^[a-zA-Z0-9_-]+$ ]] || fail "${file}: missing or invalid CF_ZONE_TOKEN; enter a zone token."
     for key in VLESS_UUID TUIC_UUID; do
         value=${!key}
         [[ -z $value || $value =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || fail "${file}: $key is not a UUID."
@@ -596,6 +597,8 @@ credentials() {
     private=$(printf '%s\n' "$pair" | awk '/PrivateKey:|Private key:/{print $NF}')
     public=$(printf '%s\n' "$pair" | awk '/Password|PublicKey:|Public key:/{print $NF}')
     [[ -n $private && -n $public ]] || fail 'Cannot generate or derive REALITY keys.'
+    # Preserve supplied encoding when deriving the public key clamps the scalar.
+    [[ -z $REALITY_PRIVATE_KEY ]] || private=$REALITY_PRIVATE_KEY
     jq -n --arg domain "$DOMAIN" --arg vless "$VLESS_UUID" --arg private "$private" --arg public "$public" --arg sid "$REALITY_SHORT_ID" --arg tuic "$TUIC_UUID" --arg password "$TUIC_PASSWORD" '{domain:$domain,vless_uuid:$vless,reality_private:$private,reality_public:$public,short_id:$sid,tuic_uuid:$tuic,tuic_password:$password}' > "$STATE/client.json"
     chmod 600 "$STATE/client.json"
     jq -r '"vless://\(.vless_uuid)@\(.domain):443?encryption=none&security=reality&sni=\(.domain)&fp=chrome&pbk=\(.reality_public)&sid=\(.short_id)&type=tcp&flow=xtls-rprx-vision#edgekit", "tuic://\(.tuic_uuid):\(.tuic_password|@uri)@\(.domain):8443?congestion_control=bbr&alpn=h3&sni=\(.domain)#edgekit"' "$STATE/client.json" > "$STATE/client-links.txt"
@@ -665,7 +668,7 @@ nginx_config() {
     static_site
     install -d -m 755 /etc/nginx/edgekit.d
     [[ ! -f /etc/nginx/conf.d/default.conf ]] || mv /etc/nginx/conf.d/default.conf "$STATE/nginx-default.conf"
-    cat > /etc/nginx/conf.d/edgekit.conf <<EOF
+    cat > "$NGINX_CONFIG" <<EOF
 log_format edgekit '\$remote_addr \$server_name \$request \$status \$ssl_protocol \$ssl_curve';
 server {
     listen 127.0.0.1:9443 ssl proxy_protocol;
@@ -699,7 +702,8 @@ check_configs() {
     nginx_cmd -t >>"$LOG" 2>&1
     "$XR_BIN" run -test -confdir "$XR" >>"$LOG" 2>&1
     "$SB_BIN" check -c "$SB_CONFIG" >>"$LOG" 2>&1
-    systemctl cat xray | grep -q -- "-confdir $XR" || fail 'Xray is not using the configuration directory.'
+    # Consume drop-ins too: grep -q can close early and trip pipefail in systemctl.
+    systemctl cat xray | grep -- "-confdir $XR" >/dev/null || fail 'Xray is not using the configuration directory.'
 }
 verify_services() {
     local s
@@ -1018,6 +1022,268 @@ update_xray() {
     update_proxy xray "$selection" "$yes"
 }
 update_singbox() { update_proxy sing-box stable "${1:-}"; }
+
+# ---------- Reconcile installation input with deployed configuration ----------
+# Read acme.sh's simple quoted settings as data, without sourcing its files.
+acme_conf_value() {
+    [[ -f $1 && ! -L $1 ]] || return 0
+    awk -v key="$2" '
+        index($0,key "=")==1 {
+            count++; value=substr($0,length(key)+2); q=sprintf("%c",39)
+            if (substr(value,1,1)!=q || substr(value,length(value),1)!=q) invalid=1
+            else print substr(value,2,length(value)-2)
+        }
+        END { if (count>1 || invalid) exit 1 }
+    ' "$1"
+}
+acme_conf_set() (
+    local file=$1 key=$2 value=$3 tmp=''
+    [[ $value != *\'* && $value != *$'\n'* && $value != *$'\r'* ]] || fail 'Invalid ACME setting.'
+    trap '[[ -z $tmp ]] || rm -f "$tmp"' EXIT
+    tmp=$(mktemp "${file}.XXXXXX")
+    awk -v key="$key" 'index($0,key "=")!=1' "$file" > "$tmp"
+    printf "%s='%s'\n" "$key" "$value" >> "$tmp"
+    chmod 600 "$tmp"; mv -f "$tmp" "$file"
+)
+reinstall_current() {
+    jq -en --slurpfile x "$XR/02_vless_reality_inbound.json" --slurpfile s "$SB_CONFIG" '
+        [$x[0].inbounds[] | select(.tag=="vless-reality" and .protocol=="vless")] as $xs |
+        [$s[0].inbounds[] | select(.tag=="tuic" and .type=="tuic")] as $ss |
+        select(($xs|length)==1 and ($ss|length)==1) | $xs[0] as $x | $ss[0] as $s |
+        select(($x.settings.clients|length)==1 and ($x.streamSettings.realitySettings.shortIds|length)==1
+            and ($x.streamSettings.realitySettings.serverNames|length)==1 and ($s.users|length)==1) |
+        {domain:$x.streamSettings.realitySettings.serverNames[0],vless_uuid:$x.settings.clients[0].id,
+         reality_private:$x.streamSettings.realitySettings.privateKey,short_id:$x.streamSettings.realitySettings.shortIds[0],
+         tuic_uuid:$s.users[0].uuid,tuic_password:$s.users[0].password} |
+        select(all(.[]; type=="string" and length>0))
+    ' || fail 'Cannot read the managed Xray and sing-box settings; no changes applied.'
+}
+reinstall_publish() (
+    local source=$1 target=$2 group=$3 mode=$4 tmp=''
+    trap '[[ -z $tmp ]] || rm -f "$tmp"' EXIT
+    tmp=$(mktemp "${target}.XXXXXX")
+    install -o root -g "$group" -m "$mode" "$source" "$tmp"
+    mv -f "$tmp" "$target"
+)
+reinstall_acme_run() {
+    "$work/acme.sh/acme.sh" --home "$work/acme.sh" --config-home "$work/acme.sh" \
+        --cert-home "$work/acme.sh" --accountconf "$work/acme.sh/account.conf" "$@"
+}
+reinstall_acme() {
+    local conf key ca hook force=()
+    cp -a "$ROOT/acme.sh" "$work/acme.sh"
+    conf=$work/acme.sh/${DOMAIN}_ecc/$DOMAIN.conf
+    if [[ ! -f $conf && -f $conf.removed ]]; then mv "$conf.removed" "$conf"; fi
+    # Remove cached zone/account selectors so a new token can use another zone.
+    for key in CF_Account_ID CF_Zone_ID SAVED_CF_Account_ID SAVED_CF_Zone_ID; do
+        acme_conf_set "$work/acme.sh/account.conf" "$key" ''
+        [[ ! -f $conf ]] || acme_conf_set "$conf" "$key" ''
+    done
+    acme_conf_set "$work/acme.sh/account.conf" SAVED_CF_Token "$CF_ZONE_TOKEN"
+    acme_conf_set "$work/acme.sh/account.conf" CF_Token ''
+    [[ ! -f $conf ]] || acme_conf_set "$conf" CF_Token "$CF_ZONE_TOKEN"
+    if ((domain_changed)); then
+        stage ACME 'Prepare the domain certificate and renewal settings before switching services.'
+        if [[ -f $conf ]]; then
+            for key in Le_ReloadCmd Le_RealCertPath Le_RealCACertPath Le_RealKeyPath Le_RealFullChainPath Le_PreHook Le_PostHook Le_RenewHook; do
+                acme_conf_set "$conf" "$key" ''
+            done
+        fi
+        ca=$(cat "$STATE/acme-ca")
+        export CF_Token=$CF_ZONE_TOKEN
+        # Reuse a valid cached certificate when switching back to a former domain.
+        if [[ ! -f $conf ]] || ! openssl x509 -in "$work/acme.sh/${DOMAIN}_ecc/fullchain.cer" -noout -checkend 86400 -checkhost "$DOMAIN" >>"$LOG" 2>&1; then
+            [[ ! -f $work/acme.sh/${DOMAIN}_ecc/$DOMAIN.cer ]] || force=(--force)
+            reinstall_acme_run --issue --server "$ca" --dns dns_cf -d "$DOMAIN" --keylength ec-256 "${force[@]}" >>"$LOG" 2>&1
+        fi
+        acme_conf_set "$conf" Le_Domain "$DOMAIN"
+        install -d -m 750 -o root -g sing-box "$work/certs" "$work/certs/$DOMAIN"
+        reinstall_acme_run --install-cert -d "$DOMAIN" --ecc \
+            --fullchain-file "$work/certs/$DOMAIN/fullchain.pem" --key-file "$work/certs/$DOMAIN/privkey.pem" --reloadcmd '' >>"$LOG" 2>&1
+        unset CF_Token
+        (local ROOT=$work; validate_certificate "$DOMAIN")
+        chown root:sing-box "$work/certs/$DOMAIN/privkey.pem"; chmod 640 "$work/certs/$DOMAIN/privkey.pem"
+        chmod 644 "$work/certs/$DOMAIN/fullchain.pem"
+        acme_conf_set "$conf" Le_RealFullChainPath "$ROOT/certs/$DOMAIN/fullchain.pem"
+        acme_conf_set "$conf" Le_RealKeyPath "$ROOT/certs/$DOMAIN/privkey.pem"
+        hook=$(printf '%s' "/bin/bash $ENTRY deploy-cert" | base64 | tr -d '\n')
+        acme_conf_set "$conf" Le_ReloadCmd "__ACME_BASE64__START_${hook}__ACME_BASE64__END_"
+        # Retain the old certificate, but stop renewing it with the new zone token.
+        if [[ $old_domain != "$DOMAIN" && -f $work/acme.sh/${old_domain}_ecc/$old_domain.conf ]]; then
+            reinstall_acme_run --remove -d "$old_domain" --ecc >>"$LOG" 2>&1
+        fi
+    fi
+    [[ ! -f $conf ]] || acme_conf_set "$conf" CF_Token "$CF_ZONE_TOKEN"
+    ! grep -Fq "$work" "$work/acme.sh/account.conf" "$conf" || fail 'Staged ACME settings contain temporary paths; no changes applied.'
+    find "$work/acme.sh" -type f -exec chmod 600 {} +
+    chmod 700 "$work/acme.sh" "$work/acme.sh/acme.sh"
+}
+reinstall() (
+    local yes=${1:-} current old_domain old_token conf key field value saved i p
+    local domain_changed=0 acme_changed=0 xray_changed=0 singbox_changed=0
+    local work='' modified=0 keep=0 reinstall_changed=() services=() paths=() present=()
+    [[ $# -le 1 && ( -z $yes || $yes == --yes ) ]] || fail 'Usage: reinstall [--yes].'
+    root_required; require_install; check_os
+    [[ -e $DEFAULT_ENV || -L $DEFAULT_ENV ]] || fail "Missing ${DEFAULT_ENV}. Restore the installation input before reinstalling; no changes applied."
+    read_env "$DEFAULT_ENV"
+    start_log reinstall
+    exec 8>"$STATE/operation.lock"; flock -n 8 || fail 'Another management operation is running.'
+    exec 9>"$STATE/renew.lock"; flock -n 9 || fail 'A renewal check is running; retry reinstall later.'
+    old_domain=$(cat "$STATE/domain")
+    [[ $old_domain =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,63}$ ]] || fail 'Invalid installed domain record.'
+    for p in "$XR/02_vless_reality_inbound.json" "$SB_CONFIG" "$NGINX_CONFIG" "$STATE/client.json" "$ROOT/acme.sh/account.conf" "$ROOT/acme.sh/${old_domain}_ecc/$old_domain.conf"; do
+        [[ -f $p && ! -L $p ]] || fail "Missing or unsupported managed configuration: ${p}. No changes applied."
+    done
+    current=$(reinstall_current)
+    conf=$ROOT/acme.sh/${old_domain}_ecc/$old_domain.conf
+    old_token=$(acme_conf_value "$conf" CF_Token) || fail 'Cannot read the saved domain DNS token.'
+    if [[ -z $old_token ]]; then old_token=$(acme_conf_value "$ROOT/acme.sh/account.conf" SAVED_CF_Token) || fail 'Cannot read the saved DNS token.'; fi
+    if [[ -z $old_token ]]; then old_token=$(acme_conf_value "$ROOT/acme.sh/account.conf" CF_Token) || fail 'Cannot read the saved DNS token.'; fi
+    [[ ${#old_token} -ge 20 && ${#old_token} -le 256 && $old_token =~ ^[a-zA-Z0-9_-]+$ ]] || fail 'Cannot determine the DNS token used for renewal; no changes applied.'
+    # Compare deployed values and their client records, not the original input file.
+    for key in DOMAIN CF_ZONE_TOKEN VLESS_UUID REALITY_PRIVATE_KEY REALITY_SHORT_ID TUIC_UUID TUIC_PASSWORD; do
+        case $key in
+            DOMAIN) field=domain;; CF_ZONE_TOKEN) field='';; VLESS_UUID) field=vless_uuid;;
+            REALITY_PRIVATE_KEY) field=reality_private;; REALITY_SHORT_ID) field=short_id;;
+            TUIC_UUID) field=tuic_uuid;; TUIC_PASSWORD) field=tuic_password;;
+        esac
+        if [[ $key == CF_ZONE_TOKEN ]]; then value=$old_token; saved=$old_token
+        else
+            value=$(jq -er --arg field "$field" '.[$field]' <<< "$current")
+            saved=$(jq -er --arg field "$field" '.[$field]' "$STATE/client.json") || fail 'Cannot read the saved client settings.'
+            if [[ -z ${!key} ]]; then printf -v "$key" '%s' "$value"; fi
+        fi
+        if [[ ${!key} != "$value" ]] || [[ ${!key} != "$saved" ]]; then reinstall_changed+=("$key")
+        elif [[ $key == DOMAIN ]] && {
+            [[ $DOMAIN != "$old_domain" || $(acme_conf_value "$conf" Le_Domain) != "$DOMAIN" ||
+               $(acme_conf_value "$conf" Le_RealFullChainPath) != "$ROOT/certs/$DOMAIN/fullchain.pem" ||
+               $(acme_conf_value "$conf" Le_RealKeyPath) != "$ROOT/certs/$DOMAIN/privkey.pem" ]] ||
+            ! jq -e --arg domain "$DOMAIN" --arg cert "$ROOT/certs/$DOMAIN/fullchain.pem" --arg private "$ROOT/certs/$DOMAIN/privkey.pem" \
+                '.inbounds[] | select(.tag=="tuic") | .tls | .server_name==$domain and .certificate_path==$cert and .key_path==$private' "$SB_CONFIG" >/dev/null ||
+            ! awk -v domain="$DOMAIN" -v cert="$ROOT/certs/$DOMAIN/fullchain.pem;" -v private="$ROOT/certs/$DOMAIN/privkey.pem;" '
+                $1=="server_name" && $2==domain ";" {n++}
+                $1=="ssl_certificate" && $2==cert {c++}
+                $1=="ssl_certificate_key" && $2==private {k++}
+                END {exit !(n==1 && c==1 && k==1)}' "$NGINX_CONFIG"
+        }; then reinstall_changed+=("$key"); fi
+    done
+    ((${#reinstall_changed[@]})) || { say 'No changes: installation input matches the deployed configuration. Blank optional fields keep current credentials.'; return 0; }
+    for key in "${reinstall_changed[@]}"; do
+        case $key in
+            DOMAIN) domain_changed=1; acme_changed=1; xray_changed=1; singbox_changed=1;;
+            CF_ZONE_TOKEN) acme_changed=1;;
+            VLESS_UUID|REALITY_PRIVATE_KEY|REALITY_SHORT_ID) xray_changed=1;;
+            TUIC_UUID|TUIC_PASSWORD) singbox_changed=1;;
+        esac
+    done
+    ((acme_changed==0)) || services+=(acme.sh)
+    ((domain_changed==0)) || services+=(Nginx)
+    ((xray_changed==0)) || services+=(Xray)
+    ((singbox_changed==0)) || services+=(sing-box)
+    say "Changed variables: ${reinstall_changed[*]}"
+    say "Components to adjust: ${services[*]}"
+    say 'Apply all listed changes together using the installed component versions.'
+    [[ $yes == --yes ]] || { confirm || { say 'Cancelled.'; return 0; }; }
+    check_configs; verify_services
+    reinstall_cleanup() {
+        local rc=$? recovery=0
+        trap - EXIT ERR INT TERM
+        set +e
+        if ((modified)); then
+            for ((i=0; i<${#paths[@]}; i++)); do
+                p=${paths[i]}
+                rm -rf -- "$p" || recovery=1
+                if [[ ${present[i]} == 1 ]]; then cp -a "$work/backup/$i" "$p" || recovery=1; fi
+            done
+            if ((recovery==0)); then
+                (check_configs) >>"$LOG" 2>&1 || recovery=1
+                if ((domain_changed)); then systemctl reload nginx >>"$LOG" 2>&1 || recovery=1; fi
+                if ((xray_changed)); then systemctl restart xray >>"$LOG" 2>&1 || recovery=1; fi
+                if ((singbox_changed)); then systemctl restart sing-box >>"$LOG" 2>&1 || recovery=1; fi
+                (verify_services) >>"$LOG" 2>&1 || recovery=1
+            fi
+            rc=1
+            if ((recovery)); then keep=1; report_error "Reinstall recovery failed; previous files kept at ${work}/backup. Log: ${LOG}."
+            else report_error 'Reinstall failed; restored the previous configuration, credentials, certificates and services.'; fi
+        fi
+        if [[ -n $work ]] && ((keep==0)); then rm -rf "$work"; fi
+        exit "$rc"
+    }
+    trap reinstall_cleanup EXIT
+    trap 'exit 130' INT TERM
+    umask 077
+    work=$(mktemp -d "$STATE/reinstall.XXXXXX")
+    install -d -m 700 "$work/state" "$work/backup"
+    if ((domain_changed)); then (local STATE=$work/state; check_dns); fi
+    # Build client records using the resolved input, including retained optional values.
+    (local STATE=$work/state; credentials)
+    if ((xray_changed)); then
+        jq --slurpfile c "$work/state/client.json" \
+            '(.inbounds[] | select(.tag=="vless-reality")) |=
+             (.settings.clients[0].id=$c[0].vless_uuid | .streamSettings.realitySettings |=
+              (.serverNames=[$c[0].domain] | .privateKey=$c[0].reality_private | .shortIds=[$c[0].short_id]))' \
+            "$XR/02_vless_reality_inbound.json" > "$work/xray.json"
+    fi
+    if ((singbox_changed)); then
+        jq --slurpfile c "$work/state/client.json" --arg cert "$ROOT/certs/$DOMAIN/fullchain.pem" --arg key "$ROOT/certs/$DOMAIN/privkey.pem" \
+            '(.inbounds[] | select(.tag=="tuic")) |=
+             (.users[0].uuid=$c[0].tuic_uuid | .users[0].password=$c[0].tuic_password |
+              .tls.server_name=$c[0].domain | .tls.certificate_path=$cert | .tls.key_path=$key)' \
+            "$SB_CONFIG" > "$work/sing-box.json"
+    fi
+    if ((domain_changed)); then
+        local listen=0.0.0.0
+        [[ ! -s $work/state/ipv6 ]] || listen=::
+        for p in xray sing-box; do
+            jq --arg listen "$listen" '(.inbounds[] | select(.tag=="vless-reality" or .tag=="tuic")).listen=$listen' "$work/$p.json" > "$work/listen.json"
+            mv -f "$work/listen.json" "$work/$p.json"
+        done
+        awk -v domain="$DOMAIN" -v cert="$ROOT/certs/$DOMAIN/fullchain.pem" -v key="$ROOT/certs/$DOMAIN/privkey.pem" '
+            $1=="server_name" {$0="    server_name " domain ";"; n++}
+            $1=="ssl_certificate" {$0="    ssl_certificate " cert ";"; c++}
+            $1=="ssl_certificate_key" {$0="    ssl_certificate_key " key ";"; k++}
+            {print} END {if (n!=1 || c!=1 || k!=1) exit 1}' "$NGINX_CONFIG" > "$work/nginx.conf"
+    fi
+    if ((acme_changed)); then reinstall_acme; fi
+    paths=("$STATE/client.json" "$STATE/client-links.txt")
+    if ((xray_changed)); then paths+=("$XR/02_vless_reality_inbound.json"); fi
+    if ((singbox_changed)); then paths+=("$SB_CONFIG"); fi
+    if ((acme_changed)); then paths+=("$ROOT/acme.sh"); fi
+    if ((domain_changed)); then paths+=("$NGINX_CONFIG" "$ROOT/certs" "$STATE/domain" "$STATE/ipv4" "$STATE/ipv6" "$STATE/cert-good" "$STATE/cert-deployed"); fi
+    for ((i=0; i<${#paths[@]}; i++)); do
+        p=${paths[i]}
+        [[ ! -L $p ]] || fail "Unsupported managed symlink: ${p}. No changes applied."
+        if [[ -e $p ]]; then cp -a "$p" "$work/backup/$i"; present+=(1); else present+=(0); fi
+    done
+    modified=1
+    stage Reinstall 'Apply the prepared configuration and verify all affected services.'
+    if ((acme_changed)); then
+        mv "$ROOT/acme.sh" "$work/replaced-acme.sh"
+        mv "$work/acme.sh" "$ROOT/acme.sh"
+    fi
+    if ((domain_changed)); then
+        rm -rf "$ROOT/certs/$DOMAIN"
+        cp -a "$work/certs/$DOMAIN" "$ROOT/certs/$DOMAIN"
+        reinstall_publish "$work/nginx.conf" "$NGINX_CONFIG" root 644
+        printf '%s\n' "$DOMAIN" > "$work/state/domain"
+        for p in domain ipv4; do reinstall_publish "$work/state/$p" "$STATE/$p" root 600; done
+        if [[ -f $work/state/ipv6 ]]; then reinstall_publish "$work/state/ipv6" "$STATE/ipv6" root 600; else rm -f "$STATE/ipv6"; fi
+    fi
+    if ((xray_changed)); then reinstall_publish "$work/xray.json" "$XR/02_vless_reality_inbound.json" xray 640; fi
+    if ((singbox_changed)); then reinstall_publish "$work/sing-box.json" "$SB_CONFIG" sing-box 640; fi
+    for p in client.json client-links.txt; do reinstall_publish "$work/state/$p" "$STATE/$p" root 600; done
+    check_configs
+    if ((domain_changed)); then systemctl reload nginx >>"$LOG" 2>&1; fi
+    if ((xray_changed)); then systemctl restart xray >>"$LOG" 2>&1; fi
+    if ((singbox_changed)); then systemctl restart sing-box >>"$LOG" 2>&1; fi
+    verify_services
+    if ((domain_changed)); then
+        rm -rf "$STATE/cert-good"; cp -a "$ROOT/certs/$DOMAIN" "$STATE/cert-good"
+        date -Ins > "$STATE/cert-deployed"
+    fi
+    modified=0
+    say "Success: adjusted ${services[*]}; client settings saved to ${STATE}/client.json and client-links.txt (root only)."
+)
 
 # Read version metadata without executing the installed or downloaded script.
 edgekit_file_version() {
@@ -1808,7 +2074,7 @@ menu() {
         status
         say $'\n1. Update Xray\n2. Update sing-box\n3. Check certificate renewal\n4. Uninstall edgekit\n5. Update edgekit\n6. Update TLS / OpenSSL\n7. Network tuning'
         say "8. $(ssh_guard_label)"
-        say '0. Exit'
+        say $'9. Reinstall\n0. Exit'
         read -r -p 'Select an option: ' choice || return 0
         case $choice in
             0) return 0;;
@@ -1830,6 +2096,7 @@ menu() {
             6) /bin/bash "$ENTRY" update-tls || say "Operation failed (exit code $?)";;
             7) /bin/bash "$ENTRY" tune-network || say "Operation failed (exit code $?)";;
             8) /bin/bash "$ENTRY" ssh-guard || say "Operation failed (exit code $?)";;
+            9) /bin/bash "$ENTRY" reinstall || say "Operation failed (exit code $?)";;
             '') say 'No option selected.'; continue;;
             *) say 'Invalid input. Try again.'; continue;;
         esac
@@ -1843,6 +2110,7 @@ main() {
     case $op in
         start) start;;
         install) install_all "$@";;
+        reinstall) reinstall "$@";;
         status) status;;
         _tls-prepare) root_required; start_log tls-prepare; tls_prepare "$@";;
         _tls-switch) root_required; start_log update-tls; tls_switch "$@";;
@@ -1859,7 +2127,7 @@ main() {
         _load-cert-services) root_required; start_log deploy-cert; validate_certificate "$(cat "$STATE/domain")"; check_configs; systemctl reload nginx; systemctl restart sing-box; verify_services;;
         _proxy-install) root_required; require_install; start_log "update-${1:-proxy}"; proxy_install "$@";;
         --version) say "edgekit $EDGEKIT_VERSION";;
-        --help|-h) say 'Usage: ek [install [--env <FILE>] [--staging]] | status | menu | renew | update-xray [latest|release] [--yes] | update-sing-box [--yes] | update-edgekit [--yes] | update-tls [--yes] | tune-network [--yes|--check] | ssh-guard [install|remove] [--yes] | uninstall [--yes] | --version';;
+        --help|-h) say 'Usage: ek [install [--env <FILE>] [--staging]] | reinstall [--yes] | status | menu | renew | update-xray [latest|release] [--yes] | update-sing-box [--yes] | update-edgekit [--yes] | update-tls [--yes] | tune-network [--yes|--check] | ssh-guard [install|remove] [--yes] | uninstall [--yes] | --version';;
         *) fail 'Unknown command. Use --help for usage.';;
     esac
 }
