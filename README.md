@@ -19,7 +19,9 @@ Run as root:
 release_url=$(curl -fsSIL -o /dev/null -w '%{url_effective}' https://github.com/xgungnir/edgekit/releases/latest) && curl -fsSL "https://raw.githubusercontent.com/xgungnir/edgekit/${release_url##*/}/setup.sh" -o /root/setup.sh && chmod 700 /root/setup.sh && /root/setup.sh
 ```
 
-Without `/root/.ek.env`, the first run creates an empty template and exits.
+Without `/root/.ek.env`, the first run creates an empty `0600` template and exits.
+An existing input must be a readable regular file. Modes such as `0644` work
+for both `/root/.ek.env` and custom `ek install --env <FILE>` paths.
 Fill in `DOMAIN` and `CF_ZONE_TOKEN`, then run `ek`,
 select `1. Install / Retry installation`, and confirm.
 Other fields can stay blank to generate credentials automatically.

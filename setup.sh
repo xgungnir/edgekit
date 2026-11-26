@@ -2,7 +2,7 @@
 # edgekit: one installed entry point for provisioning, management and renewal.
 set -Eeuo pipefail
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-EDGEKIT_VERSION=0.4.0
+EDGEKIT_VERSION=0.5.0
 ROOT=/etc/edgekit
 ENTRY=/usr/bin/ek
 DEFAULT_ENV=/root/.ek.env
@@ -173,9 +173,6 @@ init_menu() {
 read_env() {
     local file=$1 line key value
     [[ -f $file && -r $file && ! -L $file ]] || fail "Input is not a readable regular file: ${file}. Use install --env <FILE>."
-    local mode
-    mode=$(stat -c '%a' -- "$file")
-    (( (8#$mode & 077) == 0 )) || fail "Input file $file has unsafe permissions. Run chmod 600 first."
     DOMAIN='' CF_ZONE_TOKEN='' VLESS_UUID='' REALITY_PRIVATE_KEY='' REALITY_SHORT_ID='' TUIC_UUID='' TUIC_PASSWORD=''
     while IFS= read -r line || [[ -n $line ]]; do
         line=${line%$'\r'}
