@@ -2,9 +2,10 @@
 # edgekit: one installed entry point for provisioning, management and renewal.
 set -Eeuo pipefail
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-EDGEKIT_VERSION=0.5.0
+EDGEKIT_VERSION=0.6.0
 ROOT=/etc/edgekit
 ENTRY=/usr/bin/ek
+ENTRY_UPDATE_LOCK=/run/edgekit-update.lock
 DEFAULT_ENV=/root/.ek.env
 BOOTSTRAP=/root/setup.sh
 STATE=$ROOT/state
@@ -149,7 +150,7 @@ init_menu() {
     local choice
     while true; do
         say "edgekit $EDGEKIT_VERSION"
-        say $'edgekit installation is incomplete\n1. Install / Retry installation\n2. Clean up incomplete installation\n7. Network tuning'
+        say $'edgekit installation is incomplete\n1. Install / Retry installation\n2. Clean up incomplete installation\n5. Update edgekit\n7. Network tuning'
         say "8. $(ssh_guard_label)"
         say '0. Exit'
         read -r -p 'Select an option: ' choice || return 0
@@ -161,6 +162,7 @@ init_menu() {
                     if installed; then menu; return; fi
                 else say 'Cancelled.'; fi;;
             2) /bin/bash "$ENTRY" uninstall || say "Cleanup failed (exit code $?)"; [[ -f $ENTRY ]] || return 0;;
+            5) update_edgekit_from_menu;;
             7) /bin/bash "$ENTRY" tune-network || say "Operation failed (exit code $?)";;
             8) /bin/bash "$ENTRY" ssh-guard || say "Operation failed (exit code $?)";;
             '') say 'No option selected.';;
@@ -1325,14 +1327,23 @@ edgekit_script_check() {
 }
 update_edgekit() (
     local yes=${1:-} current target version release work='' atomic='' replaced=0 keep=0
+    local work_parent=${TMPDIR:-/tmp}
     [[ $# -le 1 && ( -z $yes || $yes == --yes ) ]] || fail 'Usage: update-edgekit [--yes].'
-    root_required; require_install; check_os
+    root_required; check_os
     edgekit_update_tools
+    umask 077
+    exec 7>"$ENTRY_UPDATE_LOCK"; flock -n 7 || fail 'Another edgekit update is running.'
     [[ -f $ENTRY && -x $ENTRY && ! -L $ENTRY && $(stat -c '%u:%g:%a' "$ENTRY") == 0:0:755 ]] ||
         fail "Installed entry ${ENTRY} must be a root-owned regular file with mode 0755."
-    start_log update-edgekit
-    exec 8>"$STATE/operation.lock"; flock -n 8 || fail 'Another management operation is running.'
-    exec 9>"$STATE/renew.lock"; flock -n 9 || fail 'A renewal check is running; retry the update later.'
+    # Leave the deployment directory absent when only the entry has been installed.
+    if [[ -f $STATE/owner ]]; then
+        start_log update-edgekit
+        exec 8>"$STATE/operation.lock"; flock -n 8 || fail 'Another management operation is running.'
+        exec 9>"$STATE/renew.lock"; flock -n 9 || fail 'A renewal check is running; retry the update later.'
+        work_parent=$STATE
+    elif [[ -e $STATE/installed ]]; then
+        fail 'Installation state has no ownership record; refusing to update.'
+    fi
     current=$(edgekit_file_version "$ENTRY") || fail 'Cannot read the installed edgekit version.'
     stage Versions 'Query the latest stable edgekit release from GitHub.'
     release=$(fetch https://api.github.com/repos/xgungnir/edgekit/releases/latest) || fail 'Cannot query the latest edgekit release.'
@@ -1366,7 +1377,7 @@ update_edgekit() (
     }
     trap edgekit_update_cleanup EXIT
     trap 'exit 130' INT TERM
-    work=$(mktemp -d "$STATE/edgekit-update.XXXXXX")
+    work=$(mktemp -d "$work_parent/edgekit-update.XXXXXX")
     stage Download "Download setup.sh from release ${target}; verify version and Bash entry points."
     fetch "https://raw.githubusercontent.com/xgungnir/edgekit/$target/setup.sh" -o "$work/setup.sh" || fail 'Edgekit script download failed.'
     [[ -s $work/setup.sh && $(edgekit_file_version "$work/setup.sh") == "$version" ]] || fail 'Downloaded edgekit version does not match the release.'
@@ -1381,6 +1392,14 @@ update_edgekit() (
     cleanup_bootstrap
     say "Success: edgekit updated to ${version}; configuration and running services kept."
 )
+update_edgekit_from_menu() {
+    local version
+    if /bin/bash "$ENTRY" update-edgekit; then
+        if version=$(edgekit_file_version "$ENTRY") && [[ $version != "$EDGEKIT_VERSION" ]]; then
+            exec /bin/bash "$ENTRY"
+        fi
+    else say "Operation failed (exit code $?)"; fi
+}
 # Verify running master/workers map the current library files, including after a restart.
 tls_loaded() {
     local dir=${1:-} master pid lib file inode workers
@@ -1973,21 +1992,23 @@ uninstall() {
     root_required
     if [[ ! -f $STATE/owner ]]; then
         [[ $SELF == "$ENTRY" && -f $ENTRY && ! -L $ENTRY && ! -e $STATE/installed ]] || fail 'No deployment record for this script; refusing to delete unknown resources.'
-        say "Remove the ek entry, ${DEFAULT_ENV} and matching download copy; keep other system files and SSH password protection."
+        say "Remove ${ENTRY}, ${DEFAULT_ENV} and ${BOOTSTRAP}; keep other system files and SSH password protection."
         [[ ${1:-} == --yes ]] || { confirm || { say 'Cancelled.'; return; }; }
-        cleanup_bootstrap
-        rm -f "$DEFAULT_ENV"
-        rm -f "$ENTRY"
-        say 'Success: no application services deployed; entry and default input file removed.'
+        rm -f -- "$BOOTSTRAP" "$DEFAULT_ENV" "$ENTRY"
+        say 'Success: entry, default input and downloaded script removed.'
         return
     fi
+    local s incomplete=0
     say "Remove Xray, Nginx, sing-box, acme.sh, certificates/credentials/website, daily task, ek, ${DEFAULT_ENV} and added firewall rules."
+    if ! installed; then
+        incomplete=1
+        say "Remove the downloaded script at ${BOOTSTRAP}."
+    fi
     say 'Keep installed base tools, isolated OpenSSL/PQC and dependencies, official Nginx mainline repository, enabled host network tuning and SSH password protection. Certificates are not revoked.'
     [[ ${1:-} == --yes ]] || { confirm || { say 'Cancelled.'; return; }; }
     start_log uninstall
     exec 8>"$STATE/operation.lock"; flock -n 8 || fail 'Another management operation is running.'
     stage 'Uninstall edgekit' 'Stop application services and remove deployed resources.'
-    local s
     renewal_cron remove
     for s in nginx xray sing-box; do systemctl disable --now "$s" >>"$LOG" 2>&1 || true; done
     if [[ -f $STATE/ufw-added ]]; then
@@ -2006,7 +2027,7 @@ uninstall() {
     # Retained TLS has no service or cron entry. Never remove its parent blindly.
     find "$ROOT" -mindepth 1 -maxdepth 1 ! -name tls -exec rm -rf {} +
     rmdir "$ROOT" 2>/dev/null || true
-    cleanup_bootstrap
+    if ((incomplete)); then rm -f -- "$BOOTSTRAP"; else cleanup_bootstrap; fi
     rm -f "$DEFAULT_ENV"
     rm -f "$ENTRY"
     say 'Success: deployment removed; base tools, isolated TLS runtime and official repository kept.'
@@ -2065,7 +2086,7 @@ status() {
     say "Certificate ${certificate}; renewal ${renewal}"
 }
 menu() {
-    local choice sub version
+    local choice sub
     [[ $EUID == 0 ]] || say 'Management requires root privileges. Run sudo ek.'
     while true; do
         status
@@ -2084,12 +2105,7 @@ menu() {
             2) /bin/bash "$ENTRY" update-sing-box || say "Operation failed (exit code $?)";;
             3) /bin/bash "$ENTRY" renew || say "Operation failed (exit code $?)";;
             4) /bin/bash "$ENTRY" uninstall || say "Operation failed (exit code $?)"; [[ -f $STATE/owner ]] || return 0;;
-            5)
-                if /bin/bash "$ENTRY" update-edgekit; then
-                    if version=$(edgekit_file_version "$ENTRY") && [[ $version != "$EDGEKIT_VERSION" ]]; then
-                        exec /bin/bash "$ENTRY"
-                    fi
-                else say "Operation failed (exit code $?)"; fi;;
+            5) update_edgekit_from_menu;;
             6) /bin/bash "$ENTRY" update-tls || say "Operation failed (exit code $?)";;
             7) /bin/bash "$ENTRY" tune-network || say "Operation failed (exit code $?)";;
             8) /bin/bash "$ENTRY" ssh-guard || say "Operation failed (exit code $?)";;

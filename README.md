@@ -29,6 +29,8 @@ Other fields can stay blank to generate credentials automatically.
 ## Manage
 
 Run `ek` to open the management menu, or `ek --help` to list commands.
+Select `5. Update edgekit` in either menu to update the `ek` script. You can
+also run `ek update-edgekit` before completing installation.
 
 To apply changed installation settings, edit `/root/.ek.env` and select
 `9. Reinstall`, or run `ek reinstall`. A missing input file stops the operation.
