@@ -2,7 +2,7 @@
 # edgekit: one installed entry point for provisioning, management and renewal.
 set -Eeuo pipefail
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-EDGEKIT_VERSION=0.6.0
+EDGEKIT_VERSION=0.7.0
 ROOT=/etc/edgekit
 ENTRY=/usr/bin/ek
 ENTRY_UPDATE_LOCK=/run/edgekit-update.lock
@@ -1680,20 +1680,40 @@ network_interface() {
     printf '%s\n' "$selected"
 }
 network_qdisc() {
-    local dev=$1 qdisc extra kind
-    qdisc=$(tc -j qdisc show dev "$dev")
-    jq -e 'length==1 and .[0].root==true and
-        (.[0].kind=="fq_pie" or
-         (.[0].handle=="0:" and (["fq","fq_codel","pfifo_fast"]|index($kind))!=null))' \
-        --arg kind "$(jq -r '.[0].kind' <<< "$qdisc")" <<< "$qdisc" >/dev/null || {
-        say "$qdisc" >&3; fail "${dev} has a complex or unknown qdisc (mq, shaping tree or ingress); skipped for safety, nothing overwritten."
-    }
-    extra=$(tc -j class show dev "$dev")
-    jq -e 'length==0' <<< "$extra" >/dev/null || fail "${dev} has traffic control classes; skipped for safety."
-    extra=$(tc -j filter show dev "$dev" root)
-    jq -e 'length==0' <<< "$extra" >/dev/null || fail "${dev} has root filters; skipped for safety."
-    kind=$(jq -r '.[0].kind' <<< "$qdisc")
-    printf '%s\n' "$kind"
+    local dev=$1 qdisc root kind handle classes filters parent scheduler
+    local queues=("$NETWORK_SYS/class/net/$dev/queues/"tx-*)
+    qdisc=$(tc -j qdisc show dev "$dev") || fail "Cannot read ${dev} qdiscs."
+    root=$(jq -er '[.[] | select(.root==true)] | select(length==1) | .[0] |
+        select(.handle | test("^[0-9a-f]+:$")) | [.kind, .handle] | @tsv' <<< "$qdisc") ||
+        fail "${dev} has a complex or unknown qdisc; skipped for safety."
+    read -r kind handle <<< "$root"
+    classes=$(tc -j class show dev "$dev") || fail "Cannot read ${dev} traffic control classes."
+    if [[ $kind == mq ]]; then
+        parent=$handle
+        [[ $handle != 0: ]] || parent=:
+        # A plain mq tree has one kernel-created leaf for each transmit queue.
+        scheduler=$(jq -er --argjson classes "$classes" --argjson count "${#queues[@]}" --arg parent "$parent" '
+            [.[] | select(.root!=true)] as $leaves |
+            [$leaves[].parent] as $parents |
+            select($count > 1 and ($leaves|length)==$count and ($parents|unique|length)==$count and
+                all($classes[]; .class=="mq" and .root==true) and
+                ($parents|sort)==([$classes[].handle]|sort) and
+                all($leaves[]; .handle=="0:" and (.parent | test("^" + $parent + "[1-9a-f][0-9a-f]*$")) and
+                    (.kind as $kind | ["fq","fq_codel","pfifo_fast","fq_pie"] | index($kind)!=null))) |
+            if all($leaves[]; .kind=="fq_pie") then "fq_pie" else "untuned" end' <<< "$qdisc") || {
+            say "$qdisc" >&3; fail "${dev} has a complex or unknown mq layout; skipped for safety."
+        }
+    else
+        jq -e 'length==1 and (.[0] | .kind as $kind | $kind=="fq_pie" or
+            (.handle=="0:" and (["fq","fq_codel","pfifo_fast"]|index($kind))!=null))' <<< "$qdisc" >/dev/null || {
+            say "$qdisc" >&3; fail "${dev} has a complex or unknown qdisc; skipped for safety."
+        }
+        jq -e 'length==0' <<< "$classes" >/dev/null || fail "${dev} has traffic control classes; skipped for safety."
+        scheduler=$kind
+    fi
+    filters=$(tc -j filter show dev "$dev" root) || fail "Cannot read ${dev} root filters."
+    jq -e 'length==0' <<< "$filters" >/dev/null || fail "${dev} has root filters; skipped for safety."
+    printf '%s %s %s\n' "$kind" "$handle" "$scheduler"
 }
 network_modules() {
     local output
@@ -1721,11 +1741,12 @@ network_verify() {
     ((bad == 0))
 }
 tune_network() (
-    local option=${1:-} dev kind atomic='' changed=0 STATE=/var/lib/edgekit-network
+    local option=${1:-} dev layout kind handle scheduler atomic='' changed=0 STATE=/var/lib/edgekit-network
+    local replacement=(fq_pie)
     [[ $# -le 1 && ( -z $option || $option == --yes || $option == --check ) ]] || fail 'Usage: tune-network [--yes|--check].'
     root_required; check_os
     if [[ $option != --check ]]; then
-        say 'Apply network tuning and switch the default public interface root qdisc to fq_pie; no network or VPS restart.'
+        say 'Apply network tuning and switch the default public interface queues to fq_pie. Queue replacement may briefly interrupt traffic.'
         network_conflicts <(network_config)
         [[ $option == --yes ]] || { confirm || { say 'Cancelled.'; return; }; }
         start_log network-tune
@@ -1734,13 +1755,14 @@ tune_network() (
     stage Network-preflight 'Check permissions, boot loading, default interface and actual qdisc.'
     network_environment; network_boot; network_tools "$option"
     [[ ! -L $NETWORK_CONF && ( ! -e $NETWORK_CONF || -f $NETWORK_CONF ) ]] || fail "${NETWORK_CONF} is not a regular file; refusing to overwrite."
-    dev=$(network_interface); kind=$(network_qdisc "$dev")
+    dev=$(network_interface); layout=$(network_qdisc "$dev")
+    read -r kind handle scheduler <<< "$layout"
     if [[ $option == --check ]]; then
         cmp -s <(network_config) "$NETWORK_CONF" || fail 'Tuning configuration is missing or differs from the embedded profile.'
         [[ $(stat -c '%u:%g:%a' "$NETWORK_CONF") == 0:0:644 ]] || fail 'Tuning file must be root:root 0644.'
         network_conflicts "$NETWORK_CONF"
         network_verify "$NETWORK_CONF" || fail 'Runtime parameters are not fully applied.'
-        [[ $kind == fq_pie ]] || fail "${dev} actual root qdisc is ${kind}; expected fq_pie."
+        [[ $scheduler == fq_pie ]] || fail "${dev} does not use fq_pie on all transmit queues."
     else
         # Only a same-directory temporary file is needed; no snapshots or rollback state.
         trap '[[ -z $atomic ]] || rm -f "$atomic"' EXIT
@@ -1765,16 +1787,25 @@ tune_network() (
         fi
         network_verify "$NETWORK_CONF" || fail 'sysctl verification failed; no automatic rollback. Fix the issue and retry.'
         # Inspect again immediately before touching the queue; never replace a shaping tree.
-        kind=$(network_qdisc "$dev")
-        if [[ $kind != fq_pie ]]; then
-            if ! tc qdisc replace dev "$dev" root fq_pie 2>&1 | tee -a "$LOG"; then
+        layout=$(network_qdisc "$dev")
+        read -r kind handle scheduler <<< "$layout"
+        if [[ $scheduler != fq_pie ]]; then
+            if [[ $kind == mq ]]; then
+                # Only the root has a nonzero handle. A different handle forces a rebuild.
+                replacement=(handle 1: mq)
+                [[ $handle != 1: ]] || replacement=(handle 2: mq)
+            fi
+            if ! tc qdisc replace dev "$dev" root "${replacement[@]}" 2>&1 | tee -a "$LOG"; then
                 fail "sysctl applied, but ${dev} qdisc switch failed. Fix the issue and retry."
             fi
-            kind=$(network_qdisc "$dev")
-            [[ $kind == fq_pie ]] || fail "sysctl applied, but ${dev} actual qdisc verification failed."
+            layout=$(network_qdisc "$dev")
+            read -r kind handle scheduler <<< "$layout"
+            [[ $kind == "${replacement[-1]}" && $scheduler == fq_pie ]] ||
+                fail "sysctl applied, but ${dev} actual qdisc verification failed."
         else say "[OK] ${dev} already uses fq_pie; no replacement needed."; fi
     fi
     say '[OK] sysctl parameters verified; TCP congestion control bbr, default qdisc fq_pie.'
+    [[ $kind != mq ]] || kind='mq with fq_pie leaves'
     say "[OK] Public interface ${dev}, actual root qdisc ${kind}."
     tc qdisc show dev "$dev"
     say '[INFO] systemd-sysctl loads the profile at boot. No immediate restart needed; run ek tune-network --check after a maintenance reboot.'
